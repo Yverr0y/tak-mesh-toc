@@ -1,0 +1,127 @@
+name: Mirror upstream repository
+
+on:
+  schedule:
+    - cron: "17 * * * *"
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/upstream-sync.yml"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: upstream-mirror
+  cancel-in-progress: false
+
+jobs:
+  mirror:
+    if: github.event_name != 'push' || github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out archive
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Mirror upstream branches and tags
+        shell: bash
+        env:
+          UPSTREAM_URL: https://github.com/TakMeshTOC/tak-mesh-toc.git
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          current_head="$(git rev-parse HEAD)"
+          current_parent="$(git rev-parse "${current_head}^" 2>/dev/null || true)"
+          workflow_blob="$(git rev-parse "HEAD:.github/workflows/upstream-sync.yml")"
+
+          git remote add upstream "${UPSTREAM_URL}" 2>/dev/null || git remote set-url upstream "${UPSTREAM_URL}"
+          upstream_default="$(git ls-remote --symref upstream HEAD | awk '/^ref:/ {sub("refs\\/heads\\/","",$2); print $2; exit}')"
+          test -n "${upstream_default}"
+
+          git for-each-ref --format='%(refname)' refs/upstream-heads refs/upstream-tags |
+            xargs -r -n1 git update-ref -d
+
+          git fetch --prune upstream \
+            '+refs/heads/*:refs/upstream-heads/*' \
+            '+refs/tags/*:refs/upstream-tags/*'
+
+          upstream_head="$(git rev-parse "refs/upstream-heads/${upstream_default}")"
+
+          git push --force --prune origin \
+            '+refs/upstream-heads/*:refs/heads/upstream/*'
+          git push --force --prune origin \
+            '+refs/upstream-tags/*:refs/tags/*'
+
+          if [[ "${current_parent}" == "${upstream_head}" ]] &&
+             [[ "${workflow_blob}" == "$(git rev-parse HEAD:.github/workflows/upstream-sync.yml)" ]]; then
+            echo "main already contains the current upstream commit."
+            exit 0
+          fi
+
+          cp .github/workflows/upstream-sync.yml "${RUNNER_TEMP}/upstream-sync.yml"
+          git checkout -B main "${upstream_head}"
+          mkdir -p .github/workflows
+          cp "${RUNNER_TEMP}/upstream-sync.yml" .github/workflows/upstream-sync.yml
+          git add .github/workflows/upstream-sync.yml
+          git commit -m "chore: preserve automatic upstream mirror"
+          git push --force origin main
+
+      - name: Mirror release notes and assets
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          UPSTREAM_REPOSITORY: TakMeshTOC/tak-mesh-toc
+        run: |
+          set -euo pipefail
+
+          releases_json="${RUNNER_TEMP}/upstream-releases.json"
+          gh api --paginate "repos/${UPSTREAM_REPOSITORY}/releases?per_page=100" |
+            jq -s 'add' > "${releases_json}"
+
+          jq -r '.[] | @base64' "${releases_json}" |
+          while IFS= read -r release_row; do
+            release_json="$(printf '%s' "${release_row}" | base64 --decode)"
+            tag="$(jq -r '.tag_name' <<<"${release_json}")"
+            title="$(jq -r '.name // .tag_name' <<<"${release_json}")"
+            draft="$(jq -r '.draft' <<<"${release_json}")"
+            prerelease="$(jq -r '.prerelease' <<<"${release_json}")"
+            release_dir="${RUNNER_TEMP}/release-$(printf '%s' "${tag}" | sha256sum | cut -d' ' -f1)"
+            notes_file="${release_dir}/notes.md"
+            mkdir -p "${release_dir}/assets"
+            jq -j '.body // ""' <<<"${release_json}" > "${notes_file}"
+
+            if gh release view "${tag}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+              gh release edit "${tag}" --repo "${GITHUB_REPOSITORY}" \
+                --title "${title}" --notes-file "${notes_file}" \
+                --draft="${draft}" --prerelease="${prerelease}"
+            else
+              create_args=(release create "${tag}" --repo "${GITHUB_REPOSITORY}" --verify-tag
+                --title "${title}" --notes-file "${notes_file}")
+              [[ "${draft}" == "true" ]] && create_args+=(--draft)
+              [[ "${prerelease}" == "true" ]] && create_args+=(--prerelease)
+              gh "${create_args[@]}"
+            fi
+
+            mapfile -t destination_asset_ids < <(
+              gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${tag}" --jq '.assets[].id'
+            )
+            for asset_id in "${destination_asset_ids[@]}"; do
+              gh api --method DELETE "repos/${GITHUB_REPOSITORY}/releases/assets/${asset_id}"
+            done
+
+            if [[ "$(jq '.assets | length' <<<"${release_json}")" -gt 0 ]]; then
+              gh release download "${tag}" --repo "${UPSTREAM_REPOSITORY}" \
+                --dir "${release_dir}/assets" --clobber
+              gh release upload "${tag}" "${release_dir}"/assets/* \
+                --repo "${GITHUB_REPOSITORY}" --clobber
+            fi
+          done
+
+          latest_tag="$(gh api "repos/${UPSTREAM_REPOSITORY}/releases/latest" --jq '.tag_name')"
+          gh release edit "${latest_tag}" --repo "${GITHUB_REPOSITORY}" --latest
